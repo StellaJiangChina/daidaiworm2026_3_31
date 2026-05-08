@@ -49,6 +49,7 @@
  * @param Y     目标左上角纵坐标
  * @param Image 图像数据指针（格式：[宽][高][像素数据...]）
  */
+#include "stdint.h"
 void PutImageAD(long X, long Y, LPDWORD Image)
 {
 	long	ImageW, ImageH;
@@ -143,7 +144,7 @@ PutImage_AD_LOOPX:
 }
 
 // -------------------------------------
-
+//负责虫子死后的混合正确颜色 
 /**
  * @brief 减法混合图像绘制 (Subtractive Blend)
  *
@@ -157,96 +158,111 @@ PutImage_AD_LOOPX:
  * @param Y     目标左上角纵坐标
  * @param Image 图像数据指针
  */
+/**
+ * @brief 减法混合绘制一张图像
+ * @param X  目标左上角X
+ * @param Y  目标左上角Y
+ * @param Image 图像数据，前两个DWORD分别是宽和高，后面是图像内容（行优先，像素为DWORD：ARGB）
+ */
+static inline uint8_t sub_sat8(uint8_t a, uint8_t b)
+{
+	return (a > b) ? (uint8_t)(a - b) : 0;
+}
+
+/*
+ * PutImageSB:
+ * Image 指向的内存布局：第一个 DWORD = 宽 (ImageW)
+ *                         第二个 DWORD = 高 (ImageH)
+ *                         后续为像素数据（按行，像素为 32-bit ARGB）
+ */
 void PutImageSB(long X, long Y, LPDWORD Image)
 {
-	long	ImageW, ImageH;
-	long	PasteW, PasteH;
-	long	temp;
+	long ImageW, ImageH;
+	long PasteW, PasteH;
+	long temp;
 
-	if(X > XMAX || Y > YMAX) return;
+	if (X > XMAX || Y > YMAX) return;
 
-	ImageW = *(Image ++);
-	ImageH = *(Image ++);
+	ImageW = (long)(Image[0]);
+	ImageH = (long)(Image[1]);
+	Image += 2; /* 跳过宽高，指向像素数据 */
 
-	if(X + ImageW <= XMIN || Y + ImageH <= YMIN) return;
+	if (X + ImageW <= XMIN || Y + ImageH <= YMIN) return;
 
-	PasteW = ImageW;	
+	PasteW = ImageW;
 	PasteH = ImageH;
 
-	if(X < XMIN)
+	if (X < XMIN)
 	{
 		temp = XMIN - X;
-		Image += temp;
+		Image += temp;    /* 向右跳过 temp 列像素 */
 		PasteW -= temp;
-		X=XMIN;	
+		X = XMIN;
 	}
 
-	if(Y < YMIN)
+	if (Y < YMIN)
 	{
 		temp = YMIN - Y;
-		Image += (temp * ImageW);
+		Image += (temp * ImageW); /* 向下跳过若干整行 */
 		PasteH -= temp;
-		Y=YMIN;	
+		Y = YMIN;
 	}
 
 	temp = X + PasteW - 1;
-	if(temp > XMAX)
+	if (temp > XMAX)
 	{
 		PasteW -= (temp - XMAX);
 	}
 
 	temp = Y + PasteH - 1;
-	if(temp > YMAX)
+	if (temp > YMAX)
 	{
 		PasteH -= (temp - YMAX);
 	}
 
-	_asm {
-		MOV		EBX, X
-		MOV		ECX, Y
-		MOV		EDI, lpRenderBuffer
-		MOV		ECX, [LineStartOffset+ECX*4]
-		LEA		EDI, [EDI+EBX*4]
-		MOV		ESI, Image
-		ADD		EDI, ECX
+	if (PasteW <= 0 || PasteH <= 0) return;
 
-		MOV		EBX, ImageW
-		SUB		EBX, PasteW
-		SHL		EBX, 2
+	/* 主循环：逐行逐像素做通道饱和减法 (dst_chan = dst_chan - src_chan, clamp >=0) */
+	for (long row = 0; row < PasteH; ++row)
+	{
+		/* 源像素行起始 */
+		DWORD* pSrc = Image + row * ImageW;
 
-		MOV		EDX, RENDER_WIDTH
-		SUB		EDX, PasteW
-		SHL		EDX, 2
+		/* 目标行起始：
+		   LineStartOffset 存的是字节偏移（和你原汇编一致）
+		   把字节偏移转换为像素索引除以4（每像素4字节） */
+		int lineOffsetBytes = LineStartOffset[Y + row];
+		DWORD* pDst = lpRenderBuffer + (lineOffsetBytes / 4) + X;
 
-PutImage_SB_LOOPY:
+		for (long col = 0; col < PasteW; ++col)
+		{
+			uint32_t s = pSrc[col];
+			uint32_t d = pDst[col];
 
-		MOV		ECX, PasteW
+			uint8_t sa = (uint8_t)((s >> 24) & 0xFF);
+			uint8_t sr = (uint8_t)((s >> 16) & 0xFF);
+			uint8_t sg = (uint8_t)((s >> 8) & 0xFF);
+			uint8_t sb = (uint8_t)(s & 0xFF);
 
-PutImage_SB_LOOPX:
+			uint8_t da = (uint8_t)((d >> 24) & 0xFF);
+			uint8_t dr = (uint8_t)((d >> 16) & 0xFF);
+			uint8_t dg = (uint8_t)((d >> 8) & 0xFF);
+			uint8_t db = (uint8_t)(d & 0xFF);
 
-		LODSD
+			uint8_t ra = sub_sat8(da, sa);
+			uint8_t rr = sub_sat8(dr, sr);
+			uint8_t rg = sub_sat8(dg, sg);
+			uint8_t rb = sub_sat8(db, sb);
 
-		MOVD		MM1, EAX			// MM1 = 源像素
-		MOVD		MM0, [EDI]			// MM0 = 目标像素
-		PSUBUSB		MM0, MM1			// MM0 = 目标 - 源（饱和减法）
-		MOVD		EAX, MM0
-
-		STOSD
-
-		DEC		ECX
-		JNZ		PutImage_SB_LOOPX
-
-		ADD		ESI, EBX
-		ADD		EDI, EDX
-
-		DEC		PasteH
-		JNZ		PutImage_SB_LOOPY
-		EMMS
+			pDst[col] = ((uint32_t)ra << 24) | ((uint32_t)rr << 16) | ((uint32_t)rg << 8) | (uint32_t)rb;
+		}
 	}
 }
 
-// -------------------------------------
 
+
+// -------------------------------------
+//负责刚开始加载第一张首页图片的淡入淡出
 /**
  * @brief 亮度调节图像绘制 (Brightness)
  *
@@ -265,126 +281,106 @@ PutImage_SB_LOOPX:
  * @param Image  图像数据指针
  * @param Bright 亮度系数 (0~255)
  */
+/*
+ * PutImageBR:
+ * Image 内存布局：Image[0]=宽, Image[1]=高, 之后为像素数据（按行，像素为 32-bit ARGB）
+ * Bright: 0..255（>255 表示直接用 PutImage）
+ */
 void PutImageBR(long X, long Y, LPDWORD Image, long Bright)
 {
-	long	ImageW, ImageH;
-	long	PasteW, PasteH;
-	long	temp;
+	long ImageW = (long)Image[0];
+	long ImageH = (long)Image[1];
+	long PasteW, PasteH;
+	long temp;
 
-	// Bright <= 0: 绘制黑色矩形
-	if(Bright <= 0)
+	/* Bright <= 0: 绘制黑色矩形（使用原始宽高） */
+	if (Bright <= 0)
 	{
 		SetColor(0);
-		Box(X, Y, X + (*Image) -1, Y + (*(Image + 1)) - 1);
+		Box(X, Y, X + ImageW - 1, Y + ImageH - 1);
 		return;
 	}
-	// Bright >= 255: 正常绘制
-	if(Bright > 255)
+	/* Bright > 255: 直接正常绘制（调用原 PutImage） */
+	if (Bright > 255)
 	{
 		PutImage(X, Y, Image);
 		return;
 	}
 
-	if(X > XMAX || Y > YMAX) return;
+	if (X > XMAX || Y > YMAX) return;
 
-	ImageW = *(Image ++);
-	ImageH = *(Image ++);
+	/* 跳过宽高，指向像素数据 */
+	Image += 2;
 
-	if(X + ImageW <= XMIN || Y + ImageH <= YMIN) return;
+	if (X + ImageW <= XMIN || Y + ImageH <= YMIN) return;
 
-	PasteW = ImageW;	
+	PasteW = ImageW;
 	PasteH = ImageH;
 
-	if(X < XMIN)
+	if (X < XMIN)
 	{
 		temp = XMIN - X;
-		Image += temp;
+		Image += temp;        /* 跳过左侧若干列像素 */
 		PasteW -= temp;
-		X=XMIN;	
+		X = XMIN;
 	}
 
-	if(Y < YMIN)
+	if (Y < YMIN)
 	{
 		temp = YMIN - Y;
-		Image += (temp * ImageW);
+		Image += (temp * ImageW); /* 跳过若干整行 */
 		PasteH -= temp;
-		Y=YMIN;	
+		Y = YMIN;
 	}
 
 	temp = X + PasteW - 1;
-	if(temp > XMAX)
+	if (temp > XMAX)
 	{
 		PasteW -= (temp - XMAX);
 	}
 
 	temp = Y + PasteH - 1;
-	if(temp > YMAX)
+	if (temp > YMAX)
 	{
 		PasteH -= (temp - YMAX);
 	}
 
-	// 填充 Alpha 系数到 MMX 寄存器
-	for(temp = 0; temp < 4; temp ++)
+	if (PasteW <= 0 || PasteH <= 0) return;
+
+	/*
+	 * 对每个像素的每个通道做 (src_chan * Bright) >> 8
+	 * 对应原 MMX: PUNPCKLBW + PMULLW + PSRLW + PACKUSWB
+	 */
+	for (long row = 0; row < PasteH; ++row)
 	{
-		ALPHA1[temp] = (WORD)Bright;
-	}
+		DWORD* pSrc = Image + row * ImageW;
+		/* LineStartOffset 存的是字节偏移，与原汇编一致 */
+		int lineOffsetBytes = LineStartOffset[Y + row];
+		DWORD* pDst = lpRenderBuffer + (lineOffsetBytes / 4) + X;
 
-	_asm {
-		MOV		EBX, X
-		MOV		ECX, Y
-		MOV		EDI, lpRenderBuffer
-		MOV		ECX, [LineStartOffset+ECX*4]
-		LEA		EDI, [EDI+EBX*4]
-		MOV		ESI, Image
-		ADD		EDI, ECX
+		for (long col = 0; col < PasteW; ++col)
+		{
+			uint32_t s = pSrc[col];
+			/* 分离 ARGB 通道 */
+			unsigned int sa = (s >> 24) & 0xFF;
+			unsigned int sr = (s >> 16) & 0xFF;
+			unsigned int sg = (s >> 8) & 0xFF;
+			unsigned int sb = (s) & 0xFF;
 
-		MOV		EBX, ImageW
-		SUB		EBX, PasteW
-		SHL		EBX, 2
+			/* 乘以 Bright 并右移 8 位 (等同于 /256) */
+			unsigned int ra = (sa * (unsigned int)Bright) >> 8;
+			unsigned int rr = (sr * (unsigned int)Bright) >> 8;
+			unsigned int rg = (sg * (unsigned int)Bright) >> 8;
+			unsigned int rb = (sb * (unsigned int)Bright) >> 8;
 
-		MOV		EDX, RENDER_WIDTH
-		SUB		EDX, PasteW
-		SHL		EDX, 2
-
-		MOVQ		MM3, [ALPHA1]		// MM3 = Bright 系数 (64位)
-
-PutImage_BR_LOOPY:
-
-		MOV		ECX, PasteW
-
-PutImage_BR_LOOPX:
-
-		LODSD
-
-		MOVD		MM1, EAX			// MM1 = 源像素 (32位)
-
-		PXOR		MM0, MM0			// MM0 = 0
-
-		PUNPCKLBW	MM1, MM0			// 解包：字节 -> 字 (16x4)
-
-		PMULLW		MM1, MM3			// 乘法：像素 * Bright
-
-		PSRLW		MM1, 8				// 右移 8 位（除以 256）
-
-		PACKUSWB	MM1, MM0			// 打包：字 -> 字节（饱和）
-		MOVD		EAX, MM1
-
-		STOSD
-
-		DEC		ECX
-		JNZ		PutImage_BR_LOOPX
-
-		ADD		ESI, EBX
-		ADD		EDI, EDX
-
-		DEC		PasteH
-		JNZ		PutImage_BR_LOOPY
-		EMMS
+			/* 结果必然在 0..255 范围内，无需额外饱和 */
+			pDst[col] = (ra << 24) | (rr << 16) | (rg << 8) | rb;
+		}
 	}
 }
 
 // -------------------------------------
-
+//start按回车进入后的淡入淡出
 /**
  * @brief Alpha 混合图像绘制 (Alpha Blend)
  *
@@ -406,240 +402,191 @@ PutImage_BR_LOOPX:
  */
 void PutImageAB(long X, long Y, LPDWORD Image, long Alpha)
 {
-	long	ImageW, ImageH;
-	long	PasteW, PasteH;
-	long	temp;
+	long ImageW, ImageH;
+	long PasteW, PasteH;
+	long temp;
 
-	if(Alpha <= 0)
-	{
+	/* 与原代码行为保持一致：Alpha <= 0：不绘制；Alpha > 255：直接调用 PutImage */
+	if (Alpha <= 0) {
 		return;
 	}
-	if(Alpha > 255)
-	{
+	if (Alpha > 255) {
 		PutImage(X, Y, Image);
 		return;
 	}
 
-	if(X > XMAX || Y > YMAX) return;
+	if (X > XMAX || Y > YMAX) return;
 
-	ImageW = *(Image ++);
-	ImageH = *(Image ++);
+	/* 读取宽高（保留 Image 指针未被修改的情况以便上面的 PutImage 调用能正确使用） */
+	ImageW = (long)Image[0];
+	ImageH = (long)Image[1];
 
-	if(X + ImageW <= XMIN || Y + ImageH <= YMIN) return;
+	/* 跳过宽高，指向像素数据 */
+	LPDWORD pixelData = Image + 2;
 
-	PasteW = ImageW;	
+	if (X + ImageW <= XMIN || Y + ImageH <= YMIN) return;
+
+	PasteW = ImageW;
 	PasteH = ImageH;
 
-	if(X < XMIN)
+	if (X < XMIN)
 	{
 		temp = XMIN - X;
-		Image += temp;
+		pixelData += temp;    /* 跳过左侧若干列像素 */
 		PasteW -= temp;
-		X=XMIN;	
+		X = XMIN;
 	}
 
-	if(Y < YMIN)
+	if (Y < YMIN)
 	{
 		temp = YMIN - Y;
-		Image += (temp * ImageW);
+		pixelData += (temp * ImageW); /* 跳过若干整行 */
 		PasteH -= temp;
-		Y=YMIN;	
+		Y = YMIN;
 	}
 
 	temp = X + PasteW - 1;
-	if(temp > XMAX)
+	if (temp > XMAX)
 	{
 		PasteW -= (temp - XMAX);
 	}
 
 	temp = Y + PasteH - 1;
-	if(temp > YMAX)
+	if (temp > YMAX)
 	{
 		PasteH -= (temp - YMAX);
 	}
 
-	// 填充 Alpha 系数
-	for(temp = 0; temp < 4; temp ++)
+	if (PasteW <= 0 || PasteH <= 0) return;
+
+	/* 计算系数 */
+	unsigned int a_src = (unsigned int)Alpha;
+	unsigned int a_dst = (unsigned int)(256 - Alpha);
+
+	/* 主循环：逐行逐像素混合 */
+	for (long row = 0; row < PasteH; ++row)
 	{
-		ALPHA1[temp] = (WORD)Alpha;
-		ALPHA2[temp] = (WORD)(256 - Alpha);
-	}
+		DWORD* pSrc = pixelData + row * ImageW;
+		/* LineStartOffset 存的是字节偏移（与原汇编一致） */
+		int lineOffsetBytes = LineStartOffset[Y + row];
+		DWORD* pDst = lpRenderBuffer + (lineOffsetBytes / 4) + X;
 
-	_asm {
-		MOV		EBX, X
-		MOV		ECX, Y
-		MOV		EDI, lpRenderBuffer
-		MOV		ECX, [LineStartOffset+ECX*4]
-		LEA		EDI, [EDI+EBX*4]
-		MOV		ESI, Image
-		ADD		EDI, ECX
+		for (long col = 0; col < PasteW; ++col)
+		{
+			uint32_t s = pSrc[col];
+			uint32_t d = pDst[col];
 
-		MOV		EBX, ImageW
-		SUB		EBX, PasteW
-		SHL		EBX, 2
+			unsigned int sa = (s >> 24) & 0xFF;
+			unsigned int sr = (s >> 16) & 0xFF;
+			unsigned int sg = (s >> 8) & 0xFF;
+			unsigned int sb = (s) & 0xFF;
 
-		MOV		EDX, RENDER_WIDTH
-		SUB		EDX, PasteW
-		SHL		EDX, 2
+			unsigned int da = (d >> 24) & 0xFF;
+			unsigned int dr = (d >> 16) & 0xFF;
+			unsigned int dg = (d >> 8) & 0xFF;
+			unsigned int db = (d) & 0xFF;
 
-		MOVQ		MM3, [ALPHA1]		// MM3 = Alpha
-		MOVQ		MM4, [ALPHA2]		// MM4 = 256 - Alpha
+			/* (src*Alpha + dst*(256-Alpha)) >> 8 */
+			unsigned int ra = (sa * a_src + da * a_dst) >> 8;
+			unsigned int rr = (sr * a_src + dr * a_dst) >> 8;
+			unsigned int rg = (sg * a_src + dg * a_dst) >> 8;
+			unsigned int rb = (sb * a_src + db * a_dst) >> 8;
 
-PutImage_AB_LOOPY:
-
-		MOV		ECX, PasteW
-
-PutImage_AB_LOOPX:
-
-		LODSD
-
-		MOVD		MM1, EAX			// MM1 = 源像素
-		MOVD		MM2, [EDI]			// MM2 = 目标像素
-
-		PXOR		MM0, MM0			// MM0 = 0
-
-		PUNPCKLBW	MM1, MM0			// 解包源像素
-		PUNPCKLBW	MM2, MM0			// 解包目标像素
-
-		PMULLW		MM1, MM3			// 源 * Alpha
-		PMULLW		MM2, MM4			// 目标 * (256-Alpha)
-
-		PADDUSW		MM1, MM2			// 相加
-		PSRLW		MM1, 8				// 除以 256
-
-		PACKUSWB	MM1, MM0			// 打包
-		MOVD		EAX, MM1
-
-		STOSD
-
-		DEC		ECX
-		JNZ		PutImage_AB_LOOPX
-
-		ADD		ESI, EBX
-		ADD		EDI, EDX
-
-		DEC		PasteH
-		JNZ		PutImage_AB_LOOPY
-		EMMS
+			pDst[col] = (ra << 24) | (rr << 16) | (rg << 8) | rb;
+		}
 	}
 }
 
-// -------------------------------------
-
-/**
- * @brief 带透明色的加法混合图像绘制
- *
- * 功能同 PutImageAD，但跳过颜色为 CK_VALUE（品红）的像素。
- * 适合将带透明区域的精灵以加法模式叠加到背景上。
- *
- * @param X     目标左上角横坐标
- * @param Y     目标左上角纵坐标
- * @param Image 图像数据指针
- */
+/* PutImageCKAD: 若源像素 != CK_VALUE，则目标像素 = saturate(dst + src)（每通道 0..255） */
 void PutImageCKAD(long X, long Y, LPDWORD Image)
 {
-	long	ImageW, ImageH;
-	long	PasteW, PasteH;
-	long	temp;
+	long ImageW, ImageH;
+	long PasteW, PasteH;
+	long temp;
 
-	if(X > XMAX || Y > YMAX)
-		return;						//	超出范围
+	if (X > XMAX || Y > YMAX)
+		return;
 
-	ImageW = *(Image ++);
-	ImageH = *(Image ++);
+	/* 读取宽高并移动到像素数据 */
+	ImageW = (long)(Image[0]);
+	ImageH = (long)(Image[1]);
+	Image += 2; /* 指向像素数据 */
 
-	if(X + ImageW <= XMIN || Y + ImageH <= YMIN)
-		return;						//	超出范围
+	if (X + ImageW <= XMIN || Y + ImageH <= YMIN)
+		return;
 
-	PasteW = ImageW;	
+	PasteW = ImageW;
 	PasteH = ImageH;
 
-	if(X < XMIN)
+	if (X < XMIN)
 	{
 		temp = XMIN - X;
-		Image += temp;
+		Image += temp;    /* 跳过左侧 temp 列 */
 		PasteW -= temp;
-		X=XMIN;	
+		X = XMIN;
 	}
 
-	if(Y < YMIN)
+	if (Y < YMIN)
 	{
 		temp = YMIN - Y;
-		Image += (temp * ImageW);
+		Image += (temp * ImageW); /* 跳过若干整行 */
 		PasteH -= temp;
-		Y=YMIN;	
+		Y = YMIN;
 	}
 
 	temp = X + PasteW - 1;
-	if(temp > XMAX)
+	if (temp > XMAX)
 	{
 		PasteW -= (temp - XMAX);
 	}
 
 	temp = Y + PasteH - 1;
-	if(temp > YMAX)
+	if (temp > YMAX)
 	{
 		PasteH -= (temp - YMAX);
 	}
 
-	_asm {
-		MOV		EBX, X
-		MOV		ECX, Y
-		MOV		EDI, lpRenderBuffer
-		MOV		ECX, [LineStartOffset+ECX*4]
-		LEA		EDI, [EDI+EBX*4]
-		MOV		ESI, Image
-		ADD		EDI, ECX
+	if (PasteW <= 0 || PasteH <= 0) return;
 
-		MOV		EBX, ImageW
-		SUB		EBX, PasteW
-		SHL		EBX, 2
+	for (long row = 0; row < PasteH; ++row)
+	{
+		DWORD* pSrc = Image + row * ImageW;
+		int lineOffsetBytes = LineStartOffset[Y + row]; /* 假定为字节偏移 */
+		DWORD* pDst = lpRenderBuffer + (lineOffsetBytes / 4) + X;
 
-		MOV		EDX, RENDER_WIDTH
-		SUB		EDX, PasteW
-		SHL		EDX, 2
+		for (long col = 0; col < PasteW; ++col)
+		{
+			uint32_t s = pSrc[col];
+			if (s == CK_VALUE) {
+				/* 透明色：跳过 */
+				continue;
+			}
 
-PutImage_CK_AD_LOOPY:
+			uint32_t d = pDst[col];
 
-		MOV		ECX, PasteW
+			unsigned int sa = (s >> 24) & 0xFF;
+			unsigned int sr = (s >> 16) & 0xFF;
+			unsigned int sg = (s >> 8) & 0xFF;
+			unsigned int sb = (s) & 0xFF;
 
-PutImage_CK_AD_LOOPX:
+			unsigned int da = (d >> 24) & 0xFF;
+			unsigned int dr = (d >> 16) & 0xFF;
+			unsigned int dg = (d >> 8) & 0xFF;
+			unsigned int db = (d) & 0xFF;
 
-		LODSD
-		CMP		EAX, CK_VALUE		// 检查透明色
-		JZ		PutImage_CK_AD_LOOP_SKIP
+			/* 每通道相加并饱和到 0..255 */
+			unsigned int ra = sa + da;
+			unsigned int rr = sr + dr;
+			unsigned int rg = sg + dg;
+			unsigned int rb = sb + db;
 
-		MOVD		MM1, [EDI]
-		MOVD		MM0, EAX
-		PADDUSB		MM0, MM1
-		MOVD		EAX, MM0
+			if (ra > 255) ra = 255;
+			if (rr > 255) rr = 255;
+			if (rg > 255) rg = 255;
+			if (rb > 255) rb = 255;
 
-		STOSD
-
-		DEC		ECX
-		JNZ		PutImage_CK_AD_LOOPX
-
-		ADD		ESI, EBX
-		ADD		EDI, EDX
-		DEC		PasteH
-		JNZ		PutImage_CK_AD_LOOPY
-		EMMS
-	}
-
-	return;
-
-PutImage_CK_AD_LOOP_SKIP:
-
-	_asm {
-		ADD		EDI, 4					// 跳过目标像素（不绘制）
-		DEC		ECX
-		JNZ		PutImage_CK_AD_LOOPX
-
-		ADD		ESI, EBX
-		ADD		EDI, EDX
-		DEC		PasteH
-		JNZ		PutImage_CK_AD_LOOPY
-		EMMS
+			pDst[col] = (ra << 24) | (rr << 16) | (rg << 8) | rb;
+		}
 	}
 }
 
